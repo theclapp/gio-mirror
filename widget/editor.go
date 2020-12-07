@@ -5,6 +5,7 @@ package widget
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"image"
 	"io"
 	"math"
@@ -78,8 +79,11 @@ type Editor struct {
 		y int
 	}
 
-	scroller  gesture.Scroll
-	scrollOff image.Point
+	startDrag, endDrag Point
+	dragging           bool
+	dragger            gesture.Drag
+	scroller           gesture.Scroll
+	scrollOff          image.Point
 
 	clicker gesture.Click
 
@@ -145,9 +149,17 @@ type SubmitEvent struct {
 	Text string
 }
 
+// A SelectEvent is generated when the user selects some text.
+type SelectEvent struct {
+	Text string
+}
+
 type line struct {
-	offset image.Point
-	clip   op.CallOp
+	offset   image.Point
+	clip     op.CallOp
+	selected bool
+	yOffs    int
+	dims     layout.Dimensions
 }
 
 const (
@@ -225,6 +237,82 @@ func (e *Editor) processPointer(gtx layout.Context) {
 			}
 		}
 	}
+
+	for _, evt := range e.dragger.Events(gtx.Metric, gtx, gesture.Both) {
+		// fmt.Printf("Drag event: %+v\n", evt)
+
+		switch {
+		// This case basically augments the work done in the above e.clicker
+		// code.
+		case evt.Type == pointer.Press && evt.Source == pointer.Mouse: /*,
+			evt.Type == gesture.TypeClick && evt.Source == pointer.Touch: */
+			if e.dragging {
+				continue
+			}
+
+			e.startDrag = Point{X: e.caret.col, Y: e.caret.line}
+			e.endDrag = e.startDrag
+			e.dragging = true
+
+		case evt.Type == pointer.Drag && evt.Source == pointer.Mouse:
+			if !e.dragging {
+				continue
+			}
+
+			e.blinkStart = gtx.Now
+			e.moveCoord(image.Point{
+				X: int(math.Round(float64(evt.Position.X))),
+				Y: int(math.Round(float64(evt.Position.Y))),
+			})
+			e.endDrag = Point{X: e.caret.col, Y: e.caret.line}
+			e.caret.scroll = true
+
+		case evt.Type == pointer.Release && evt.Source == pointer.Mouse: /*,
+			/* evt.Type == gesture.TypeClick && evt.Source == pointer.Touch: */
+			if !e.dragging {
+				continue
+			}
+
+			e.blinkStart = gtx.Now
+			e.moveCoord(image.Point{
+				X: int(math.Round(float64(evt.Position.X))),
+				Y: int(math.Round(float64(evt.Position.Y))),
+			})
+			e.endDrag = Point{X: e.caret.col, Y: e.caret.line}
+			e.caret.scroll = true
+			e.dragging = false
+
+			// If they dragged back to where they started, abort.
+			if e.startDrag == e.endDrag {
+				break
+			}
+
+			// Start must be <= end.
+			e.startDrag, e.endDrag = sortPoints(e.startDrag, e.endDrag)
+
+			// Grab the selected text.
+			var selection string
+			if e.startDrag.Y == e.endDrag.Y {
+				selection = e.lines[e.startDrag.Y].Layout.Text[e.startDrag.X:e.endDrag.X]
+			} else {
+				var b strings.Builder
+				b.WriteString(e.lines[e.startDrag.Y].Layout.Text[e.startDrag.X:])
+				for i := e.startDrag.Y + 1; i < e.endDrag.Y; i++ {
+					b.WriteString(e.lines[i].Layout.Text)
+				}
+				b.WriteString(e.lines[e.endDrag.Y].Layout.Text[:e.endDrag.X])
+				selection = b.String()
+			}
+
+			if selection != "" {
+				fmt.Printf("Selection: '%s'\n", selection)
+				e.events = append(e.events, SelectEvent{
+					Text: selection,
+				})
+			}
+		}
+	}
+
 	if (sdist > 0 && soff >= smax) || (sdist < 0 && soff <= smin) {
 		e.scroller.Stop()
 	}
@@ -400,7 +488,10 @@ func (e *Editor) layout(gtx layout.Context) layout.Dimensions {
 	}
 	clip := textPadding(e.lines)
 	clip.Max = clip.Max.Add(e.viewSize)
-	it := lineIterator{
+	startSel, endSel := sortPoints(e.startDrag, e.endDrag)
+	it := segmentIterator{
+		StartSel:  startSel,
+		EndSel:    endSel,
 		Lines:     e.lines,
 		Clip:      clip,
 		Alignment: e.Alignment,
@@ -409,12 +500,12 @@ func (e *Editor) layout(gtx layout.Context) layout.Dimensions {
 	}
 	e.shapes = e.shapes[:0]
 	for {
-		layout, off, ok := it.Next()
+		layout, off, selected, yOffs, dims, ok := it.Next()
 		if !ok {
 			break
 		}
 		path := e.shaper.Shape(e.font, e.textSize, layout)
-		e.shapes = append(e.shapes, line{off, path})
+		e.shapes = append(e.shapes, line{off, path, selected, yOffs, dims})
 	}
 
 	key.InputOp{Tag: &e.eventKey}.Add(gtx.Ops)
@@ -432,6 +523,7 @@ func (e *Editor) layout(gtx layout.Context) layout.Dimensions {
 	pointer.Rect(r).Add(gtx.Ops)
 	e.scroller.Add(gtx.Ops)
 	e.clicker.Add(gtx.Ops)
+	e.dragger.Add(gtx.Ops)
 	e.caret.on = false
 	if e.focused {
 		now := gtx.Now
@@ -449,12 +541,22 @@ func (e *Editor) layout(gtx layout.Context) layout.Dimensions {
 	return layout.Dimensions{Size: e.viewSize, Baseline: e.dims.Baseline}
 }
 
+func sortPoints(a, b Point) (a2, b2 Point) {
+	if b.Less(a) {
+		return b, a
+	}
+	return a, b
+}
+
 func (e *Editor) PaintText(gtx layout.Context) {
 	cl := textPadding(e.lines)
 	cl.Max = cl.Max.Add(e.viewSize)
 	for _, shape := range e.shapes {
 		stack := op.Push(gtx.Ops)
 		op.Offset(layout.FPt(shape.offset)).Add(gtx.Ops)
+		if shape.selected {
+			drawHighlight(gtx, shape.yOffs, shape.dims)
+		}
 		shape.clip.Add(gtx.Ops)
 		clip.Rect(cl.Sub(shape.offset)).Add(gtx.Ops)
 		paint.PaintOp{}.Add(gtx.Ops)
@@ -964,3 +1066,4 @@ func nullLayout(r io.Reader) ([]text.Line, error) {
 
 func (s ChangeEvent) isEditorEvent() {}
 func (s SubmitEvent) isEditorEvent() {}
+func (s SelectEvent) isEditorEvent() {}

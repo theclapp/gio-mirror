@@ -90,6 +90,7 @@ type Axis uint8
 const (
 	Horizontal Axis = iota
 	Vertical
+	Both
 )
 
 const (
@@ -346,6 +347,8 @@ func (d *Drag) Events(cfg unit.Metric, q event.Queue, axis Axis) []pointer.Event
 				e.Position.Y = d.start.Y
 			case Vertical:
 				e.Position.X = d.start.X
+			case Both:
+				// Do nothing
 			}
 			if e.Priority < pointer.Grabbed {
 				diff := e.Position.Sub(d.start)
