@@ -96,7 +96,25 @@ func (e *editBuffer) gapLen() int {
 }
 
 func (e *editBuffer) Reset() {
-	e.pos = 0
+	e.Seek(0, io.SeekStart)
+}
+
+// Seek implements io.Seeker
+func (e *editBuffer) Seek(offset int64, whence int) (ret int64, err error) {
+	switch whence {
+	case io.SeekStart:
+		e.pos = int(offset)
+	case io.SeekCurrent:
+		e.pos += int(offset)
+	case io.SeekEnd:
+		e.pos = e.len() - int(offset)
+	}
+	if e.pos < 0 {
+		e.pos = 0
+	} else if e.pos > e.len() {
+		e.pos = e.len()
+	}
+	return int64(e.pos), nil
 }
 
 func (e *editBuffer) Read(p []byte) (int, error) {

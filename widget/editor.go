@@ -5,7 +5,6 @@ package widget
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"image"
 	"io"
 	"math"
@@ -79,11 +78,11 @@ type Editor struct {
 		y int
 	}
 
-	startDrag, endDrag Point
-	dragging           bool
-	dragger            gesture.Drag
-	scroller           gesture.Scroll
-	scrollOff          image.Point
+	Selection Selection
+	dragging  bool
+	dragger   gesture.Drag
+	scroller  gesture.Scroll
+	scrollOff image.Point
 
 	clicker gesture.Click
 
@@ -91,6 +90,13 @@ type Editor struct {
 	events []EditorEvent
 	// prevEvents is the number of events from the previous frame.
 	prevEvents int
+}
+
+// Selection describes the screen coordinates and offsets within the
+// editorBuffer of selected text.
+type Selection struct {
+	StartPx, EndPx   Point // screen coordinates
+	StartOfs, EndOfs int   // offsets within the editBuffer
 }
 
 type maskReader struct {
@@ -155,11 +161,11 @@ type SelectEvent struct {
 }
 
 type line struct {
-	offset   image.Point
-	clip     op.CallOp
-	selected bool
-	yOffs    int
-	dims     layout.Dimensions
+	offset         image.Point
+	clip           op.CallOp
+	selected       bool
+	selectionYOffs int
+	selectionDims  layout.Dimensions
 }
 
 const (
@@ -199,7 +205,16 @@ func (e *Editor) makeValid() {
 	e.caret.col = col
 	e.caret.x = x
 	e.caret.y = y
+	e.Selection.makeValid(e)
 	e.valid = true
+}
+
+func (s *Selection) makeValid(e *Editor) {
+	if s.StartOfs != s.EndOfs {
+		positions := e.offsetToScreenPos(sortInts(s.StartOfs, s.EndOfs))
+		s.StartPx = positions[0].linePos
+		s.EndPx = positions[1].linePos
+	}
 }
 
 func (e *Editor) processPointer(gtx layout.Context) {
@@ -239,8 +254,6 @@ func (e *Editor) processPointer(gtx layout.Context) {
 	}
 
 	for _, evt := range e.dragger.Events(gtx.Metric, gtx, gesture.Both) {
-		// fmt.Printf("Drag event: %+v\n", evt)
-
 		switch {
 		// This case basically augments the work done in the above e.clicker
 		// code.
@@ -250,8 +263,12 @@ func (e *Editor) processPointer(gtx layout.Context) {
 				continue
 			}
 
-			e.startDrag = Point{X: e.caret.col, Y: e.caret.line}
-			e.endDrag = e.startDrag
+			// Note that this relies on the previous clicker event having done an
+			// e.moveCoord.
+			e.Selection.StartPx = Point{X: e.caret.col, Y: e.caret.line}
+			e.Selection.EndPx = e.Selection.StartPx
+			e.Selection.StartOfs = e.rr.caret
+			e.Selection.EndOfs = e.Selection.StartOfs
 			e.dragging = true
 
 		case evt.Type == pointer.Drag && evt.Source == pointer.Mouse:
@@ -264,7 +281,8 @@ func (e *Editor) processPointer(gtx layout.Context) {
 				X: int(math.Round(float64(evt.Position.X))),
 				Y: int(math.Round(float64(evt.Position.Y))),
 			})
-			e.endDrag = Point{X: e.caret.col, Y: e.caret.line}
+			e.Selection.EndPx = Point{X: e.caret.col, Y: e.caret.line}
+			e.Selection.EndOfs = e.rr.caret
 			e.caret.scroll = true
 
 		case evt.Type == pointer.Release && evt.Source == pointer.Mouse: /*,
@@ -278,38 +296,37 @@ func (e *Editor) processPointer(gtx layout.Context) {
 				X: int(math.Round(float64(evt.Position.X))),
 				Y: int(math.Round(float64(evt.Position.Y))),
 			})
-			e.endDrag = Point{X: e.caret.col, Y: e.caret.line}
+			e.Selection.EndPx = Point{X: e.caret.col, Y: e.caret.line}
+			e.Selection.EndOfs = e.rr.caret
 			e.caret.scroll = true
 			e.dragging = false
 
-			// If they dragged back to where they started, abort.
-			if e.startDrag == e.endDrag {
+			// If they dragged back to where they started (or just clicked and
+			// didn't drag), abort.
+			if e.Selection.StartOfs == e.Selection.EndOfs {
 				break
 			}
 
-			// Start must be <= end.
-			e.startDrag, e.endDrag = sortPoints(e.startDrag, e.endDrag)
+			// Start must be <= end for the below code to work.
+			if e.Selection.StartOfs > e.Selection.EndOfs {
+				e.Selection.StartOfs, e.Selection.EndOfs = e.Selection.EndOfs, e.Selection.StartOfs
+			}
 
 			// Grab the selected text.
-			var selection string
-			if e.startDrag.Y == e.endDrag.Y {
-				selection = e.lines[e.startDrag.Y].Layout.Text[e.startDrag.X:e.endDrag.X]
-			} else {
-				var b strings.Builder
-				b.WriteString(e.lines[e.startDrag.Y].Layout.Text[e.startDrag.X:])
-				for i := e.startDrag.Y + 1; i < e.endDrag.Y; i++ {
-					b.WriteString(e.lines[i].Layout.Text)
-				}
-				b.WriteString(e.lines[e.endDrag.Y].Layout.Text[:e.endDrag.X])
-				selection = b.String()
+			buf := make([]byte, e.Selection.EndOfs-e.Selection.StartOfs)
+			e.rr.Seek(int64(e.Selection.StartOfs), io.SeekStart)
+			_, err := e.rr.Read(buf)
+			if err != nil {
+				// The only error that e.rr.Read can return is EOF, which just
+				// means no selection. Given that we've made sure that
+				// e.Selection.StartOfs != e.Selection.EndOfs, that shouldn't
+				// happen.
+				break
 			}
 
-			if selection != "" {
-				fmt.Printf("Selection: '%s'\n", selection)
-				e.events = append(e.events, SelectEvent{
-					Text: selection,
-				})
-			}
+			e.events = append(e.events, SelectEvent{
+				Text: string(buf),
+			})
 		}
 	}
 
@@ -353,6 +370,7 @@ func (e *Editor) processKey(gtx layout.Context) {
 			e.append(ke.Text)
 		}
 		if e.rr.Changed() {
+			e.clearSelection()
 			e.events = append(e.events, ChangeEvent{})
 		}
 	}
@@ -488,7 +506,7 @@ func (e *Editor) layout(gtx layout.Context) layout.Dimensions {
 	}
 	clip := textPadding(e.lines)
 	clip.Max = clip.Max.Add(e.viewSize)
-	startSel, endSel := sortPoints(e.startDrag, e.endDrag)
+	startSel, endSel := sortPoints(e.Selection.StartPx, e.Selection.EndPx)
 	it := segmentIterator{
 		StartSel:  startSel,
 		EndSel:    endSel,
@@ -541,8 +559,19 @@ func (e *Editor) layout(gtx layout.Context) layout.Dimensions {
 	return layout.Dimensions{Size: e.viewSize, Baseline: e.dims.Baseline}
 }
 
+func (e *Editor) clearSelection() {
+	e.Selection = Selection{}
+}
+
 func sortPoints(a, b Point) (a2, b2 Point) {
 	if b.Less(a) {
+		return b, a
+	}
+	return a, b
+}
+
+func sortInts(a, b int) (a2, b2 int) {
+	if b < a {
 		return b, a
 	}
 	return a, b
@@ -551,14 +580,14 @@ func sortPoints(a, b Point) (a2, b2 Point) {
 func (e *Editor) PaintText(gtx layout.Context) {
 	cl := textPadding(e.lines)
 	cl.Max = cl.Max.Add(e.viewSize)
+	clip.Rect(cl).Add(gtx.Ops)
 	for _, shape := range e.shapes {
 		stack := op.Push(gtx.Ops)
 		op.Offset(layout.FPt(shape.offset)).Add(gtx.Ops)
 		if shape.selected {
-			drawHighlight(gtx, shape.yOffs, shape.dims)
+			paintSelection(gtx, shape.selectionYOffs, shape.selectionDims)
 		}
 		shape.clip.Add(gtx.Ops)
-		clip.Rect(cl.Sub(shape.offset)).Add(gtx.Ops)
 		paint.PaintOp{}.Add(gtx.Ops)
 		stack.Pop()
 	}
@@ -718,10 +747,34 @@ func (e *Editor) CaretCoords() f32.Point {
 	return f32.Pt(float32(e.caret.x)/64, float32(e.caret.y))
 }
 
+type combinedPos struct {
+	linePos Point
+	x       fixed.Int26_6
+	y       int
+}
+
+// layoutCaret takes the underlying e.rr.caret and returns the line and
+// offset, and the (x, y) pixel position.
 func (e *Editor) layoutCaret() (line, col int, x fixed.Int26_6, y int) {
+	p := e.offsetToScreenPos(e.rr.caret)[0]
+	return p.linePos.Y, p.linePos.X, p.x, p.y
+}
+
+// offsetToScreenPos takes a list of e.rr offsets (derived from previous
+// values of e.rr.caret) and returns a list of combinedPos points that
+// correspond to their current screen positions. The caret positions must be
+// sorted, lowest first.
+//
+// This function is written this way to take advantage of previous work done
+// for offsets after the first. Otherwise you have to start from the top each
+// time.
+func (e *Editor) offsetToScreenPos(offsets ...int) []combinedPos {
+	var line, col, y int
+	var x fixed.Int26_6
+
 	var idx int
 	var prevDesc fixed.Int26_6
-loop:
+	var positions []combinedPos
 	for {
 		x = 0
 		col = 0
@@ -729,21 +782,45 @@ loop:
 		y += (prevDesc + l.Ascent).Ceil()
 		prevDesc = l.Descent
 		for _, adv := range l.Layout.Advances {
-			if idx == e.rr.caret {
-				break loop
+			if idx == offsets[0] {
+				positions = append(positions,
+					combinedPos{
+						linePos: Point{X: col, Y: line},
+						x:       x + align(e.Alignment, e.lines[line].Width, e.viewSize.X),
+						y:       y,
+					})
+				if len(offsets) == 1 {
+					return positions
+				}
+				offsets = offsets[1:]
 			}
 			x += adv
 			_, s := e.rr.runeAt(idx)
 			idx += s
 			col++
 		}
-		if line == len(e.lines)-1 || idx > e.rr.caret {
-			break
+		if lastLine := line == len(e.lines)-1; lastLine || idx > offsets[0] {
+			pos := combinedPos{
+				linePos: Point{X: col, Y: line},
+				x:       x + align(e.Alignment, e.lines[line].Width, e.viewSize.X),
+				y:       y,
+			}
+			positions = append(positions, pos)
+			if len(offsets) == 1 {
+				return positions
+			}
+			offsets = offsets[1:]
+			if lastLine {
+				// We've run out of lines: return the last position for the rest
+				// of the offsets (which should be the end of the editor).
+				for range offsets {
+					positions = append(positions, pos)
+				}
+				return positions
+			}
 		}
 		line++
 	}
-	x += align(e.Alignment, e.lines[line].Width, e.viewSize.X)
-	return
 }
 
 func (e *Editor) invalidate() {

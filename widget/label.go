@@ -43,8 +43,8 @@ type segmentIterator struct {
 	layout text.Layout // current line's Layout
 
 	// pixel positions
-	off            fixed.Point26_6
-	x, y, prevDesc fixed.Int26_6
+	off         fixed.Point26_6
+	y, prevDesc fixed.Int26_6
 }
 
 const inf = 1e6
@@ -54,12 +54,14 @@ func (l *segmentIterator) Next() (text.Layout, image.Point, bool, int, layout.Di
 		if l.pos.X == 0 {
 			l.line = l.Lines[l.pos.Y]
 
-			// Calculate X & Y pixel coordinates of left edge of line
-			l.x = align(l.Alignment, l.line.Width, l.Width) + fixed.I(l.Offset.X)
+			// Calculate X & Y pixel coordinates of left edge of line. We need y
+			// for the next line, so it's in l, but we only need x here, so it's
+			// not.
+			x := align(l.Alignment, l.line.Width, l.Width) + fixed.I(l.Offset.X)
 			l.y += l.prevDesc + l.line.Ascent
 			l.prevDesc = l.line.Descent
 			// Align baseline and line start to the pixel grid.
-			l.off = fixed.Point26_6{X: fixed.I(l.x.Floor()), Y: fixed.I(l.y.Ceil())}
+			l.off = fixed.Point26_6{X: fixed.I(x.Floor()), Y: fixed.I(l.y.Ceil())}
 			l.y = l.off.Y
 			l.off.Y += fixed.I(l.Offset.Y)
 			if (l.off.Y + l.line.Bounds.Min.Y).Floor() > l.Clip.Max.Y {
@@ -72,7 +74,11 @@ func (l *segmentIterator) Next() (text.Layout, image.Point, bool, int, layout.Di
 				continue
 			}
 
+			// Copy the line's Layout, since we slice it up later.
 			l.layout = l.line.Layout
+
+			// Find the left edge of the text visible in the l.Clip clipping
+			// area.
 			for len(l.layout.Advances) > 0 {
 				_, n := utf8.DecodeRuneInString(l.layout.Text)
 				adv := l.layout.Advances[0]
@@ -93,7 +99,8 @@ func (l *segmentIterator) Next() (text.Layout, image.Point, bool, int, layout.Di
 		retLayout := l.layout
 		for n := range l.layout.Text {
 			selChanged := selected != l.inSelection()
-			if (endx+l.line.Bounds.Min.X).Floor() > l.Clip.Max.X || selChanged {
+			beyondClipEdge := (endx + l.line.Bounds.Min.X).Floor() > l.Clip.Max.X
+			if selChanged || beyondClipEdge {
 				retLayout.Advances = l.layout.Advances[:rune]
 				retLayout.Text = l.layout.Text[:n]
 				if selChanged {
@@ -108,9 +115,11 @@ func (l *segmentIterator) Next() (text.Layout, image.Point, bool, int, layout.Di
 			rune++
 			l.pos.X++
 		}
-		offf := image.Point{X: l.off.X.Floor(), Y: l.off.Y.Floor()}
+		offFloor := image.Point{X: l.off.X.Floor(), Y: l.off.Y.Floor()}
 
 		// Calculate the width & height if the returned text.
+		//
+		// If there's a better way to do this, I'm all ears.
 		var d fixed.Int26_6
 		for _, adv := range retLayout.Advances {
 			d += adv
@@ -129,7 +138,7 @@ func (l *segmentIterator) Next() (text.Layout, image.Point, bool, int, layout.Di
 			l.off.X = endx
 		}
 
-		return retLayout, offf, selected, l.line.Descent.Ceil(), dims, true
+		return retLayout, offFloor, selected, l.prevDesc.Ceil(), dims, true
 	}
 	return text.Layout{}, image.Point{}, false, 0, layout.Dimensions{}, false
 }
@@ -165,15 +174,12 @@ func (l Label) Layout(gtx layout.Context, s text.Shaper, font text.Font, size un
 		Width:     dims.Size.X,
 	}
 	for {
-		l, off, selected, yOffs, dims, ok := it.Next()
+		l, off, _, _, _, ok := it.Next()
 		if !ok {
 			break
 		}
 		stack := op.Push(gtx.Ops)
 		op.Offset(layout.FPt(off)).Add(gtx.Ops)
-		if selected {
-			drawHighlight(gtx, yOffs, dims)
-		}
 		s.Shape(font, textSize, l).Add(gtx.Ops)
 		clip.Rect(cl.Sub(off)).Add(gtx.Ops)
 		paint.PaintOp{}.Add(gtx.Ops)
@@ -243,14 +249,14 @@ func align(align text.Alignment, width fixed.Int26_6, maxWidth int) fixed.Int26_
 	}
 }
 
-func drawHighlight(gtx layout.Context, yOffs int, dims layout.Dimensions) {
+func paintSelection(gtx layout.Context, selectionYOffs int, selectionDims layout.Dimensions) {
 	stack := op.Push(gtx.Ops)
-	op.Offset(f32.Point{Y: float32(yOffs)}).Add(gtx.Ops)
+	op.Offset(f32.Pt(0, float32(selectionYOffs))).Add(gtx.Ops)
 	paint.FillShape(gtx.Ops,
 		color.NRGBA{B: 0xff, A: 0x40},
 		clip.UniformRRect(
 			f32.Rectangle{
-				Max: layout.FPt(dims.Size),
+				Max: layout.FPt(selectionDims.Size),
 			},
 			0).Op(gtx.Ops))
 	stack.Pop()
